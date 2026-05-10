@@ -15,7 +15,12 @@ from transformers.quantizers import AutoHfQuantizer, HfQuantizer
 
 from .profiler import LayeredProfiler
 
-from optimum.bettertransformer import BetterTransformer
+try:
+    from optimum.bettertransformer import BetterTransformer
+    _has_bettertransformer = True
+except ImportError:
+    BetterTransformer = None
+    _has_bettertransformer = False
 
 from .utils import clean_memory, load_layer, \
     find_or_create_local_splitted_path
@@ -90,6 +95,7 @@ class AirLLMBaseModel(GenerationMixin):
         self.total_gpu_loading_time = None
         self.total_compression_overhead_time = None
         self._supports_cache_class = False
+        self._layer_types = None  # heterogeneous layer types, e.g. Qwen3_5
         self.hf_quantizer = None
 
         if compression is not None:
@@ -122,6 +128,8 @@ class AirLLMBaseModel(GenerationMixin):
         else:
             self.config = AutoConfig.from_pretrained(self.model_local_path, trust_remote_code=True)
 
+        self._adjust_config_for_model()
+
         self.generation_config = self.get_generation_config()
         #print(f"using generation_config: {self.generation_config}")
 
@@ -132,7 +140,7 @@ class AirLLMBaseModel(GenerationMixin):
 
         # get layer count:
         model_attr = self.model
-        for attr_name in self.layer_names_dict["layer_prefix"].split("."):
+        for attr_name in self._get_model_access_path("layer_prefix").split("."):
             model_attr = getattr(model_attr, attr_name)
 
         layers_count = len(model_attr)
@@ -178,37 +186,43 @@ class AirLLMBaseModel(GenerationMixin):
     def get_use_better_transformer(self):
         return True
 
+    def _adjust_config_for_model(self):
+        pass
+
+    def _get_model_access_path(self, layer_name_key):
+        return self.layer_names_dict[layer_name_key]
+
     def init_model(self):
 
         # try way 1 better transformers...
         # Load meta model (no memory used)
         self.model = None
 
-        if self.get_use_better_transformer():
+        if self.get_use_better_transformer() and _has_bettertransformer:
             try:
                 with init_empty_weights():
                     self.model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=True)
                     self.model = BetterTransformer.transform(self.model)  # enable flash attention
-            except ValueError as ve:
+            except (ValueError, TypeError) as ve:
                 del self.model
                 clean_memory()
                 self.model = None
 
-            if self.model is None:
-                # try way 2.
-                try:
+        if self.model is None and self.get_use_better_transformer():
+            # try way 2.
+            try:
 
-                    print(f"new version of transfomer, no need to use BetterTransformer, try setting attn impl to sdpa...")
-                    self.config.attn_implementation = "sdpa"
+                print(f"new version of transfomer, no need to use BetterTransformer, try setting attn impl to sdpa...")
+                self.config.attn_implementation = "sdpa"
 
-                    with init_empty_weights():
-                        self.model = AutoModelForCausalLM.from_config(self.config, attn_implementation="sdpa", trust_remote_code=True)
-                    print(f"attn imp: {type(self.model.model.layers[3].self_attn)}")
+                with init_empty_weights():
+                    self.model = AutoModelForCausalLM.from_config(self.config, attn_implementation="sdpa", trust_remote_code=True)
+                print(f"attn imp: {type(self.model.model.layers[3].self_attn)}")
 
-                except TypeError as ve:
-                    del self.model
-                    clean_memory()
-                    self.model = None
+            except (TypeError, ValueError) as ve:
+                del self.model
+                clean_memory()
+                self.model = None
 
         # fallback to original way
         if self.model is None:
@@ -407,8 +421,7 @@ class AirLLMBaseModel(GenerationMixin):
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
-        if cache_utils_installed:
-            # we don't support kv cache for new version yet
+        if cache_utils_installed and not self._supports_cache_class:
             use_cache = False
 
         if self.profiling_mode:

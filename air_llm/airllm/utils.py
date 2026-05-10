@@ -262,29 +262,35 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
     single_modelfile = None
 
+    # build shard number -> filename mapping from weight_map
+    shard_filenames = {}
+    for v in index.values():
+        if '-' in v:
+            parts = v.split('-')
+            if len(parts) > 1:
+                try:
+                    shard_num = int(parts[1])
+                    shard_filenames[shard_num] = v
+                except ValueError:
+                    pass
+
     for layer in tqdm(layers):
 
-        # Optionnally load next shard
-        # checking whether after spliting from '-', if second element exists. otherwise it throws errors for single 'model.safetensor' files
         shards = [int(v.split('-')[1]) for k, v in index.items() if k.startswith(layer) and '-' in v and len(v.split('-')) > 1]
         if len(shards) > 0:
             if max(shards) > shard:
-                # optinoally delete original file
                 if delete_original and shard != 0:
-                    if not safetensors_format:
-                        to_delete = checkpoint_path / f'pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin'
-                    else:
-                        to_delete = checkpoint_path / f'model-000{shard:02d}-of-000{n_shards:02d}.safetensors'
-
+                    old_filename = shard_filenames.get(shard, f'model-000{shard:02d}-of-000{n_shards:02d}.safetensors' if safetensors_format else f'pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin')
+                    to_delete = checkpoint_path / old_filename
                     print(f"deleting original file: {to_delete}")
                     remove_real_and_linked_file(to_delete)
                 shard += 1
                 print(f'Loading shard {shard}/{n_shards}')
 
-                if not safetensors_format:
-                    to_load = checkpoint_path / f'pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin'
-                else:
-                    to_load = checkpoint_path / f'model-000{shard:02d}-of-000{n_shards:02d}.safetensors'
+                to_load = shard_filenames.get(shard)
+                if to_load is None:
+                    to_load = f'model-000{shard:02d}-of-000{n_shards:02d}.safetensors' if safetensors_format else f'pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin'
+                to_load = checkpoint_path / to_load
 
                 # check if to_load exist, if not downloaad it...
                 if not os.path.exists(to_load):
@@ -299,6 +305,9 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
         else:
             shards = [v for k, v in index.items() if k.startswith(layer)]
+            if len(shards) == 0:
+                # no weights for this layer (e.g. tied lm_head), skip
+                continue
             single_modelfile = shards[0]
             to_load = checkpoint_path / single_modelfile
             # check if to_load exist, if not downloaad it...
