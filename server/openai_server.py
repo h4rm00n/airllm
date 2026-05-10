@@ -20,9 +20,11 @@ Endpoints:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -54,6 +56,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = 1.0
     stream: bool = False
     stop: Optional[list[str]] = None
+    enable_thinking: bool = False
 
 class CompletionRequest(BaseModel):
     model: str = ""
@@ -105,6 +108,8 @@ class ModelList(BaseModel):
 # ── Generation wrapper (sequential access) ──────────────────────────────
 
 class AirLLMGenerator:
+    _THINK_PATTERN = re.compile(r"<think\s*>(.*?)</think\s*>", re.DOTALL)
+
     def __init__(self, model_path: str, device: str = "cuda:0",
                  dtype: str = "float16", max_seq_len: int = 4096):
         from airllm import AutoModel
@@ -208,7 +213,7 @@ class AirLLMGenerator:
                     break
 
                 outputs = self.model(
-                    input_ids=next_id.unsqueeze(0),
+                    input_ids=next_id.view(1, 1),
                     past_key_values=past_kv,
                     use_cache=True,
                 )
@@ -216,17 +221,79 @@ class AirLLMGenerator:
 
             logger.info(f"Stream done: {len(generated_ids)} tokens generated")
 
+    @staticmethod
+    def _parse_thinking_content(text: str) -> tuple[str, Optional[str]]:
+        match = AirLLMGenerator._THINK_PATTERN.search(text)
+        if match:
+            reasoning = match.group(1).strip()
+            content = text[match.end():].strip()
+            return content, reasoning
+        return text.strip(), None
+
+    def chat_generate(self, messages: list[dict], max_tokens: int = 256,
+                      temperature: float = 0.7, top_p: float = 1.0,
+                      stop: list[str] | None = None,
+                      enable_thinking: bool = False) -> tuple[str, int, int, Optional[str]]:
+        prompt = self._build_chat_prompt(messages, enable_thinking=enable_thinking)
+        text, prompt_tokens, completion_tokens = self.generate(
+            prompt, max_tokens=max_tokens, temperature=temperature,
+            top_p=top_p, stop=stop,
+        )
+        if enable_thinking:
+            content, reasoning = self._parse_thinking_content(text)
+            return content, prompt_tokens, completion_tokens, reasoning
+        return text, prompt_tokens, completion_tokens, None
+
     def chat_generate_stream(self, messages: list[dict], max_tokens: int = 256,
                              temperature: float = 0.7, top_p: float = 1.0,
-                             stop: list[str] | None = None) -> Generator[str, None, None]:
-        prompt = self._build_chat_prompt(messages)
-        yield from self.generate_stream(prompt, max_tokens, temperature, top_p, stop)
+                             stop: list[str] | None = None,
+                             enable_thinking: bool = False) -> Generator[tuple[str, Optional[str]], None, None]:
+        prompt = self._build_chat_prompt(messages, enable_thinking=enable_thinking)
+        thinking_buffer = ""
+        think_open = False
+        think_closed = False
+        for chunk in self.generate_stream(prompt, max_tokens, temperature, top_p, stop):
+            if not enable_thinking:
+                yield chunk, None
+                continue
+            thinking_buffer += chunk
+            if not think_closed:
+                if not think_open:
+                    idx = thinking_buffer.find("<think")
+                    if idx != -1:
+                        before = thinking_buffer[:idx]
+                        if before.strip():
+                            yield before, None
+                        thinking_buffer = thinking_buffer[idx:]
+                        think_open = True
+                if think_open:
+                    close_idx = thinking_buffer.find("</think")
+                    if close_idx != -1:
+                        end_idx = thinking_buffer.find(">", close_idx)
+                        if end_idx != -1:
+                            reasoning = thinking_buffer[len("<think"):close_idx]
+                            if reasoning.startswith(">"):
+                                reasoning = reasoning[1:]
+                            thinking_buffer = thinking_buffer[end_idx + 1:]
+                            yield thinking_buffer, reasoning.strip()
+                            thinking_buffer = ""
+                            think_closed = True
+                    else:
+                        reasoning_so_far = thinking_buffer[len("<think"):]
+                        if reasoning_so_far.startswith(">"):
+                            reasoning_so_far = reasoning_so_far[1:]
+                        yield "", reasoning_so_far
+                        thinking_buffer = ""
+            else:
+                if chunk:
+                    yield chunk, None
 
-    def _build_chat_prompt(self, messages: list[dict]) -> str:
+    def _build_chat_prompt(self, messages: list[dict],
+                           enable_thinking: bool = False) -> str:
         if hasattr(self.tokenizer, 'apply_chat_template') and self.tokenizer.chat_template:
             return self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=False,
+                enable_thinking=enable_thinking,
             )
         return "\n".join(f"{m['role']}: {m['content']}" for m in messages)
 
@@ -254,11 +321,31 @@ def create_app(generator: AirLLMGenerator) -> FastAPI:
                 gen = generator.chat_generate_stream(
                     messages, max_tokens=req.max_tokens,
                     temperature=req.temperature, top_p=req.top_p,
-                    stop=req.stop,
+                    stop=req.stop, enable_thinking=req.enable_thinking,
                 )
+                loop = asyncio.get_event_loop()
+                _sentinel = object()
+
+                def _next_gen(g):
+                    v = next(g, _sentinel)
+                    if v is _sentinel:
+                        raise StopAsyncIteration
+                    return v
+
                 try:
-                    for tok in gen:
-                        yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': generator.model_name, 'choices': [{'index': 0, 'delta': {'content': tok}, 'finish_reason': None}]})}\n\n"
+                    while True:
+                        try:
+                            tok = await loop.run_in_executor(None, _next_gen, gen)
+                        except StopAsyncIteration:
+                            break
+                        content, reasoning = tok
+                        delta: dict = {}
+                        if reasoning:
+                            delta["reasoning_content"] = reasoning
+                        if content:
+                            delta["content"] = content
+                        if delta:
+                            yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': generator.model_name, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]})}\n\n"
                 except Exception as e:
                     import traceback
                     logger.error(f"Stream error: {e}\n{traceback.format_exc()}")
@@ -276,15 +363,17 @@ def create_app(generator: AirLLMGenerator) -> FastAPI:
                          "X-Accel-Buffering": "no"},
             )
 
-        text, prompt_tokens, completion_tokens = generator.chat_generate(
+        text, prompt_tokens, completion_tokens, reasoning = generator.chat_generate(
             messages, max_tokens=req.max_tokens,
             temperature=req.temperature, top_p=req.top_p, stop=req.stop,
+            enable_thinking=req.enable_thinking,
         )
+        msg: dict = {"role": "assistant", "content": text}
+        if reasoning is not None:
+            msg["reasoning_content"] = reasoning
         return ChatCompletionResponse(
             id=req_id, created=int(time.time()), model=generator.model_name,
-            choices=[Choice(index=0, message={"role": "assistant",
-                                              "content": text},
-                            finish_reason="stop")],
+            choices=[Choice(index=0, message=msg, finish_reason="stop")],
             usage=Usage(prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         total_tokens=prompt_tokens + completion_tokens),
@@ -301,8 +390,21 @@ def create_app(generator: AirLLMGenerator) -> FastAPI:
                     temperature=req.temperature, top_p=req.top_p,
                     stop=req.stop,
                 )
+                loop = asyncio.get_event_loop()
+                _sentinel = object()
+
+                def _next_gen(g):
+                    v = next(g, _sentinel)
+                    if v is _sentinel:
+                        raise StopAsyncIteration
+                    return v
+
                 try:
-                    for tok in gen:
+                    while True:
+                        try:
+                            tok = await loop.run_in_executor(None, _next_gen, gen)
+                        except StopAsyncIteration:
+                            break
                         yield f"data: {json.dumps({'id': req_id, 'object': 'text_completion.chunk', 'created': int(time.time()), 'model': generator.model_name, 'choices': [{'index': 0, 'text': tok, 'finish_reason': None}]})}\n\n"
                 except Exception as e:
                     logger.error(f"Stream error: {e}")
