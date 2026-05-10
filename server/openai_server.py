@@ -21,18 +21,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
 import uuid
 import threading
-from queue import Queue
-from typing import Optional
+from typing import Optional, Generator
 
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("airllm-server")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -115,58 +118,126 @@ class AirLLMGenerator:
         )
         self.tokenizer = self.model.tokenizer
         self._lock = threading.Lock()
-        self._stop_cache: dict[str, list[int]] = {}
 
     @property
     def model_name(self) -> str:
         return os.path.basename(self.model_path.rstrip("/"))
 
+    def _prepare_kwargs(self, max_tokens: int, temperature: float, top_p: float,
+                        stop: list[str] | None = None) -> dict:
+        kwargs = {"max_new_tokens": max_tokens, "use_cache": True}
+        if temperature < 0.01:
+            kwargs["do_sample"] = False
+        else:
+            kwargs["do_sample"] = True
+            kwargs["temperature"] = temperature
+            kwargs["top_p"] = top_p
+        if stop:
+            stop_ids = []
+            for s in stop:
+                ids = self.tokenizer(s, add_special_tokens=False).input_ids
+                stop_ids.extend(ids)
+            if stop_ids:
+                kwargs["eos_token_id"] = list(set(
+                    [self.tokenizer.eos_token_id] + stop_ids
+                ))
+        return kwargs
+
     def generate(self, prompt: str, max_tokens: int = 256,
                  temperature: float = 0.7, top_p: float = 1.0,
-                 stop: list[str] | None = None,
-                 stream_callback=None) -> tuple[str, int, int]:
+                 stop: list[str] | None = None) -> tuple[str, int, int]:
+        with self._lock:
+            inputs = self.tokenizer(prompt, return_tensors="pt")
+            input_ids = inputs.input_ids.to(self.device)
+            prompt_len = input_ids.shape[1]
+            gen_kwargs = self._prepare_kwargs(max_tokens, temperature, top_p, stop)
+            output_ids = self.model.generate(input_ids, **gen_kwargs)
+            new_ids = output_ids[0, prompt_len:]
+            text = self.tokenizer.decode(new_ids, skip_special_tokens=True)
+            return text, prompt_len, len(new_ids)
+
+    def generate_stream(self, prompt: str, max_tokens: int = 256,
+                        temperature: float = 0.7, top_p: float = 1.0,
+                        stop: list[str] | None = None) -> Generator[str, None, tuple[int, int, str]]:
+        """True streaming: yields tokens one by one as they are generated.
+        Returns (prompt_len, completion_len, full_text) after exhaustion."""
         with self._lock:
             inputs = self.tokenizer(prompt, return_tensors="pt")
             input_ids = inputs.input_ids.to(self.device)
             prompt_len = input_ids.shape[1]
 
-            gen_kwargs = {"max_new_tokens": max_tokens, "use_cache": True}
-            if temperature < 0.01:
-                gen_kwargs["do_sample"] = False
-            else:
-                gen_kwargs["do_sample"] = True
-                gen_kwargs["temperature"] = temperature
-                gen_kwargs["top_p"] = top_p
-
+            eos_ids = {self.tokenizer.eos_token_id}
             if stop:
-                self._stop_cache[id(self)] = \
-                    self.tokenizer(stop, add_special_tokens=False).input_ids
+                for s in stop:
+                    eos_ids.update(self.tokenizer(s, add_special_tokens=False).input_ids)
 
-            output_ids = self.model.generate(input_ids, **gen_kwargs)
-            new_ids = output_ids[0, prompt_len:]
+            gen_kwargs = self._prepare_kwargs(max_tokens, temperature, top_p)
+            gen_kwargs.pop("eos_token_id", None)
 
-            if stream_callback:
-                for i in range(len(new_ids)):
-                    tok = self.tokenizer.decode([new_ids[i].item()],
+            logger.info(f"Stream generate: prompt_len={prompt_len}, max_new={max_tokens}")
+
+            # manual generation loop for per-token streaming
+            past_kv = None
+            full_ids = input_ids
+            generated_ids = []
+            prev_text = ""
+
+            # first forward: prefill
+            outputs = self.model(input_ids=input_ids, use_cache=True,
+                                 past_key_values=past_kv)
+            past_kv = outputs.past_key_values
+
+            for step in range(max_tokens):
+                logits = outputs.logits[:, -1, :]
+                if temperature < 0.01:
+                    next_id = logits.argmax(dim=-1)
+                else:
+                    logits = logits / max(temperature, 0.01)
+                    if top_p < 1.0:
+                        sorted_logits, sorted_indices = logits.sort(descending=True)
+                        cumsum = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+                        cutoff = (cumsum > top_p).int().argmax(dim=-1) + 1
+                        logits[:, sorted_indices[0, cutoff:]] = float('-inf')
+                    probs = logits.softmax(dim=-1)
+                    next_id = probs.multinomial(1)
+
+                token_id = next_id.item()
+                generated_ids.append(token_id)
+                full_text = self.tokenizer.decode(generated_ids,
+                                                  skip_special_tokens=True)
+                new_text = full_text[len(prev_text):]
+                if new_text:
+                    yield new_text
+                prev_text = full_text
+
+                if token_id in eos_ids:
+                    break
+
+                # next decode step
+                outputs = self.model(
+                    input_ids=next_id.unsqueeze(0),
+                    past_key_values=past_kv,
+                    use_cache=True,
+                )
+                past_kv = outputs.past_key_values
+
+            full_output = self.tokenizer.decode(generated_ids,
                                                 skip_special_tokens=True)
-                    stream_callback(tok)
+            return prompt_len, len(generated_ids), full_output
 
-            text = self.tokenizer.decode(new_ids, skip_special_tokens=True)
-            return text, prompt_len, len(new_ids)
+    def chat_generate_stream(self, messages: list[dict], max_tokens: int = 256,
+                             temperature: float = 0.7, top_p: float = 1.0,
+                             stop: list[str] | None = None) -> Generator[str, None, tuple[int, int, str]]:
+        prompt = self._build_chat_prompt(messages)
+        return (yield from self.generate_stream(prompt, max_tokens, temperature, top_p, stop))
 
-    def chat_generate(self, messages: list[dict], max_tokens: int = 256,
-                      temperature: float = 0.7, top_p: float = 1.0,
-                      stop: list[str] | None = None,
-                      stream_callback=None) -> tuple[str, int, int]:
-        if not hasattr(self.tokenizer, 'apply_chat_template'):
-            prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
-        else:
-            prompt = self.tokenizer.apply_chat_template(
+    def _build_chat_prompt(self, messages: list[dict]) -> str:
+        if hasattr(self.tokenizer, 'apply_chat_template') and self.tokenizer.chat_template:
+            return self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
                 enable_thinking=False,
             )
-        return self.generate(prompt, max_tokens, temperature, top_p,
-                             stop, stream_callback)
+        return "\n".join(f"{m['role']}: {m['content']}" for m in messages)
 
 
 # ── FastAPI app ─────────────────────────────────────────────────────────
@@ -188,35 +259,33 @@ def create_app(generator: AirLLMGenerator) -> FastAPI:
         req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
         if req.stream:
-            def event_stream():
-                chunks = []
-                def cb(tok: str):
-                    chunks.append(tok)
-
-                text, prompt_tokens, completion_tokens = generator.chat_generate(
+            async def event_stream():
+                gen = generator.chat_generate_stream(
                     messages, max_tokens=req.max_tokens,
                     temperature=req.temperature, top_p=req.top_p,
-                    stop=req.stop, stream_callback=cb,
+                    stop=req.stop,
                 )
-                for i, tok in enumerate(chunks):
-                    choice = Choice(
-                        index=0,
-                        delta={"role": "assistant" if i == 0 else None,
-                               "content": tok},
-                        finish_reason="stop" if i == len(chunks) - 1 else None,
-                    )
-                    chunk = {
-                        "id": req_id, "object": "chat.completion.chunk",
-                        "created": int(time.time()), "model": generator.model_name,
-                        "choices": [choice.model_dump(exclude_none=True)],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                yield "data: [DONE]\n\n"
+                prompt_tokens = completion_tokens = 0
+                try:
+                    prev_text = ""
+                    for tok in gen:
+                        if completion_tokens == 0:
+                            yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': generator.model_name, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': tok}, 'finish_reason': None}]})}\n\n"
+                        else:
+                            yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': generator.model_name, 'choices': [{'index': 0, 'delta': {'content': tok}, 'finish_reason': None}]})}\n\n"
+                        completion_tokens += 1
+                except Exception as e:
+                    logger.error(f"Stream error: {e}")
+                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': generator.model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                    yield "data: [DONE]\n\n"
 
             return StreamingResponse(
                 event_stream(),
                 media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
+                         "X-Accel-Buffering": "no"},
             )
 
         text, prompt_tokens, completion_tokens = generator.chat_generate(
@@ -238,24 +307,26 @@ def create_app(generator: AirLLMGenerator) -> FastAPI:
         req_id = f"cmpl-{uuid.uuid4().hex[:12]}"
 
         if req.stream:
-            def event_stream():
-                chunks = []
-                def cb(tok):
-                    chunks.append(tok)
-                generator.generate(req.prompt, max_tokens=req.max_tokens,
-                                   temperature=req.temperature, top_p=req.top_p,
-                                   stop=req.stop, stream_callback=cb)
-                for i, tok in enumerate(chunks):
-                    choice = Choice(index=0, text=tok,
-                                    finish_reason="stop" if i == len(chunks) - 1 else None)
-                    chunk = {
-                        "id": req_id, "object": "text_completion.chunk",
-                        "created": int(time.time()), "model": generator.model_name,
-                        "choices": [choice.model_dump(exclude_none=True)],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-            return StreamingResponse(event_stream(), media_type="text/event-stream")
+            async def event_stream():
+                gen = generator.generate_stream(
+                    req.prompt, max_tokens=req.max_tokens,
+                    temperature=req.temperature, top_p=req.top_p,
+                    stop=req.stop,
+                )
+                try:
+                    for tok in gen:
+                        yield f"data: {json.dumps({'id': req_id, 'object': 'text_completion.chunk', 'created': int(time.time()), 'model': generator.model_name, 'choices': [{'index': 0, 'text': tok, 'finish_reason': None}]})}\n\n"
+                except Exception as e:
+                    logger.error(f"Stream error: {e}")
+                else:
+                    yield f"data: {json.dumps({'id': req_id, 'object': 'text_completion.chunk', 'created': int(time.time()), 'model': generator.model_name, 'choices': [{'index': 0, 'text': '', 'finish_reason': 'stop'}]})}\n\n"
+                    yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                event_stream(), media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
+                         "X-Accel-Buffering": "no"},
+            )
 
         text, pt, ct = generator.generate(
             req.prompt, max_tokens=req.max_tokens,
