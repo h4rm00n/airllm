@@ -51,6 +51,14 @@ except ImportError:
 class AirLLMBaseModel(GenerationMixin):
 
     # customize layer names here
+    @staticmethod
+    def _resolve_safe_compute_dtype(dtype):
+        _fp8_names = ('float8_e4m3fn', 'float8_e5m2', 'float8_e4m3fnuz', 'float8_e5m2fnez')
+        for name in _fp8_names:
+            if dtype == getattr(torch, name, None):
+                return torch.bfloat16
+        return dtype
+
     def set_layer_names_dict(self):
         self.layer_names_dict = {'embed': 'model.embed_tokens',
                        'layer_prefix': 'model.layers',
@@ -121,6 +129,7 @@ class AirLLMBaseModel(GenerationMixin):
         self.device = torch.device(self.running_device)
         self.running_dtype = dtype
         self.dtype = self.running_dtype
+        self._safe_compute_dtype = self._resolve_safe_compute_dtype(dtype)
 
         # Create model
         if hf_token is not None:
@@ -245,7 +254,7 @@ class AirLLMBaseModel(GenerationMixin):
         # Move buffers to device (not that much GPU memory used)
         for buffer_name, buffer in self.model.named_buffers():
             set_module_tensor_to_device(self.model, buffer_name, self.running_device, value=buffer,
-                                        dtype=self.running_dtype)
+                                        dtype=self._safe_compute_dtype)
 
         if 'rotary_pos_emb' in self.layer_names_dict:
             # for glm keep rotary_pos_emb in gpu
@@ -329,7 +338,7 @@ class AirLLMBaseModel(GenerationMixin):
                 not self.hf_quantizer.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
                ):
                 set_module_tensor_to_device(self.model, param_name, self.running_device, value=state_dict[param_name],
-                                            dtype=self.running_dtype,
+                                            dtype=self._safe_compute_dtype,
                                             )
             else:
                 torch_dtype = self.hf_quantizer.update_torch_dtype(None)

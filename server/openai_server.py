@@ -41,12 +41,27 @@ logger = logging.getLogger("airllm-server")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+try:
+    from PIL import Image
+    import io, base64, re as _re
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
 
 # ── OpenAI-compatible request/response schemas ──────────────────────────
 
+class ImageURL(BaseModel):
+    url: str
+
+class ContentPart(BaseModel):
+    type: str
+    text: Optional[str] = None
+    image_url: Optional[ImageURL] = None
+
 class Message(BaseModel):
     role: str
-    content: str
+    content: str | list[ContentPart]
 
 class ChatCompletionRequest(BaseModel):
     model: str = ""
@@ -57,6 +72,7 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     stop: Optional[list[str]] = None
     enable_thinking: bool = False
+    detail: Optional[str] = None
 
 class CompletionRequest(BaseModel):
     model: str = ""
@@ -115,18 +131,61 @@ class AirLLMGenerator:
         from airllm import AutoModel
         self.model_path = model_path
         self.device = device
-        self._dtype = getattr(torch, dtype)
+        _DTYPE_ALIASES = {
+            "float8": "float8_e4m3fn",
+            "fp8": "float8_e4m3fn",
+            "fp16": "float16",
+            "bf16": "bfloat16",
+            "fp32": "float32",
+        }
+        dtype_key = _DTYPE_ALIASES.get(dtype, dtype)
+        self._dtype = getattr(torch, dtype_key)
         self.max_seq_len = max_seq_len
         self.model = AutoModel.from_pretrained(
             model_path, device=device, dtype=self._dtype,
             max_seq_len=max_seq_len, prefetching=False,
         )
         self.tokenizer = self.model.tokenizer
+        if self.is_multimodal and hasattr(self.tokenizer, 'tokenizer'):
+            self._text_tokenizer = self.tokenizer.tokenizer
+        else:
+            self._text_tokenizer = self.tokenizer
         self._lock = threading.Lock()
 
     @property
     def model_name(self) -> str:
         return os.path.basename(self.model_path.rstrip("/"))
+
+    @property
+    def is_multimodal(self) -> bool:
+        return hasattr(self.model, '_is_vl_model') and self.model._is_vl_model
+
+    @staticmethod
+    def _load_image_from_url(url: str) -> "Image.Image":
+        if not _PIL_AVAILABLE:
+            raise ImportError("PIL is required for image inputs: pip install Pillow")
+        if url.startswith("data:"):
+            match = _re.match(r"data:image/[^;]+;base64,(.*)", url)
+            if match:
+                data = base64.b64decode(match.group(1))
+                return Image.open(io.BytesIO(data)).convert("RGB")
+        if url.startswith("http://") or url.startswith("https://"):
+            import requests
+            resp = requests.get(url, timeout=30)
+            return Image.open(io.BytesIO(resp.content)).convert("RGB")
+        return Image.open(url).convert("RGB")
+
+    def _extract_images_from_messages(self, messages: list[dict]) -> list["Image.Image"]:
+        images = []
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        url = part.get("image_url", {}).get("url", "")
+                        if url:
+                            images.append(self._load_image_from_url(url))
+        return images
 
     def _prepare_kwargs(self, max_tokens: int, temperature: float, top_p: float,
                         stop: list[str] | None = None) -> dict:
@@ -140,40 +199,57 @@ class AirLLMGenerator:
         if stop:
             stop_ids = []
             for s in stop:
-                ids = self.tokenizer(s, add_special_tokens=False).input_ids
+                ids = self._text_tokenizer(s, add_special_tokens=False).input_ids
                 stop_ids.extend(ids)
             if stop_ids:
                 kwargs["eos_token_id"] = list(set(
-                    [self.tokenizer.eos_token_id] + stop_ids
+                    [self._text_tokenizer.eos_token_id] + stop_ids
                 ))
         return kwargs
 
-    def generate(self, prompt: str, max_tokens: int = 256,
+    def generate(self, prompt: str = None, max_tokens: int = 256,
                  temperature: float = 0.7, top_p: float = 1.0,
-                 stop: list[str] | None = None) -> tuple[str, int, int]:
+                 stop: list[str] | None = None,
+                 pixel_values=None, image_grid_thw=None,
+                 input_ids=None) -> tuple[str, int, int]:
         with self._lock:
-            inputs = self.tokenizer(prompt, return_tensors="pt")
-            input_ids = inputs.input_ids.to(self.device)
+            if input_ids is None:
+                tok = self._text_tokenizer if pixel_values is None else self.tokenizer
+                inputs = tok(prompt, return_tensors="pt")
+                input_ids = inputs.input_ids.to(self.device)
+            else:
+                input_ids = input_ids.to(self.device)
             prompt_len = input_ids.shape[1]
             gen_kwargs = self._prepare_kwargs(max_tokens, temperature, top_p, stop)
+            if pixel_values is not None:
+                gen_kwargs["pixel_values"] = pixel_values.to(
+                    device=self.device, dtype=self.model.running_dtype
+                )
+                gen_kwargs["image_grid_thw"] = image_grid_thw
             output_ids = self.model.generate(input_ids, **gen_kwargs)
             new_ids = output_ids[0, prompt_len:]
-            text = self.tokenizer.decode(new_ids, skip_special_tokens=True)
+            text = self._text_tokenizer.decode(new_ids, skip_special_tokens=True)
             return text, prompt_len, len(new_ids)
 
-    def generate_stream(self, prompt: str, max_tokens: int = 256,
+    def generate_stream(self, prompt: str = None, max_tokens: int = 256,
                         temperature: float = 0.7, top_p: float = 1.0,
-                        stop: list[str] | None = None) -> Generator[str, None, None]:
+                        stop: list[str] | None = None,
+                        pixel_values=None, image_grid_thw=None,
+                        input_ids=None) -> Generator[str, None, None]:
         """True streaming: yields text chunks as they are generated."""
         with self._lock:
-            inputs = self.tokenizer(prompt, return_tensors="pt")
-            input_ids = inputs.input_ids.to(self.device)
+            if input_ids is None:
+                tok = self._text_tokenizer if pixel_values is None else self.tokenizer
+                inputs = tok(prompt, return_tensors="pt")
+                input_ids = inputs.input_ids.to(self.device)
+            else:
+                input_ids = input_ids.to(self.device)
             prompt_len = input_ids.shape[1]
 
-            eos_ids = {self.tokenizer.eos_token_id}
+            eos_ids = {self._text_tokenizer.eos_token_id}
             if stop:
                 for s in stop:
-                    ids = self.tokenizer(s, add_special_tokens=False).input_ids
+                    ids = self._text_tokenizer(s, add_special_tokens=False).input_ids
                     for tid in ids:
                         eos_ids.add(tid)
 
@@ -183,7 +259,14 @@ class AirLLMGenerator:
             generated_ids = []
             prev_text = ""
 
-            outputs = self.model(input_ids=input_ids, use_cache=True)
+            fwd_kwargs = {"use_cache": True}
+            if pixel_values is not None:
+                fwd_kwargs["pixel_values"] = pixel_values.to(
+                    device=self.device, dtype=self.model.running_dtype
+                )
+                fwd_kwargs["image_grid_thw"] = image_grid_thw
+
+            outputs = self.model(input_ids=input_ids, **fwd_kwargs)
             past_kv = outputs.past_key_values
 
             for step in range(max_tokens):
@@ -202,8 +285,8 @@ class AirLLMGenerator:
 
                 token_id = next_id.item()
                 generated_ids.append(token_id)
-                full_text = self.tokenizer.decode(generated_ids,
-                                                  skip_special_tokens=True)
+                full_text = self._text_tokenizer.decode(generated_ids,
+                                                          skip_special_tokens=True)
                 new_text = full_text[len(prev_text):]
                 if new_text:
                     yield new_text
@@ -234,10 +317,15 @@ class AirLLMGenerator:
                       temperature: float = 0.7, top_p: float = 1.0,
                       stop: list[str] | None = None,
                       enable_thinking: bool = False) -> tuple[str, int, int, Optional[str]]:
-        prompt = self._build_chat_prompt(messages, enable_thinking=enable_thinking)
+        images = self._extract_images_from_messages(messages) if self.is_multimodal else []
+        prompt, pre_input_ids, pixel_values, image_grid_thw = self._build_chat_prompt(
+            messages, images=images, enable_thinking=enable_thinking,
+        )
         text, prompt_tokens, completion_tokens = self.generate(
-            prompt, max_tokens=max_tokens, temperature=temperature,
+            prompt=prompt, max_tokens=max_tokens, temperature=temperature,
             top_p=top_p, stop=stop,
+            pixel_values=pixel_values, image_grid_thw=image_grid_thw,
+            input_ids=pre_input_ids,
         )
         if enable_thinking:
             content, reasoning = self._parse_thinking_content(text)
@@ -248,11 +336,19 @@ class AirLLMGenerator:
                              temperature: float = 0.7, top_p: float = 1.0,
                              stop: list[str] | None = None,
                              enable_thinking: bool = False) -> Generator[tuple[str, Optional[str]], None, None]:
-        prompt = self._build_chat_prompt(messages, enable_thinking=enable_thinking)
+        images = self._extract_images_from_messages(messages) if self.is_multimodal else []
+        prompt, pre_input_ids, pixel_values, image_grid_thw = self._build_chat_prompt(
+            messages, images=images, enable_thinking=enable_thinking,
+        )
         thinking_buffer = ""
         think_open = False
         think_closed = False
-        for chunk in self.generate_stream(prompt, max_tokens, temperature, top_p, stop):
+        for chunk in self.generate_stream(
+            prompt=prompt, max_tokens=max_tokens, temperature=temperature,
+            top_p=top_p, stop=stop,
+            pixel_values=pixel_values, image_grid_thw=image_grid_thw,
+            input_ids=pre_input_ids,
+        ):
             if not enable_thinking:
                 yield chunk, None
                 continue
@@ -288,14 +384,57 @@ class AirLLMGenerator:
                 if chunk:
                     yield chunk, None
 
-    def _build_chat_prompt(self, messages: list[dict],
-                           enable_thinking: bool = False) -> str:
+    def _build_chat_prompt(self, messages: list[dict], images: list | None = None,
+                           enable_thinking: bool = False) -> tuple:
+        text_messages = []
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            parts.append(part.get("text", ""))
+                        elif part.get("type") == "image_url":
+                            parts.append("<|image_pad|>")
+                text_messages.append({"role": m["role"], "content": " ".join(parts) if parts else ""})
+            else:
+                text_messages.append({"role": m["role"], "content": content or ""})
+
+        pixel_values = None
+        image_grid_thw = None
+
+        if images and self.is_multimodal:
+            try:
+                has_processor = hasattr(self.tokenizer, 'image_processor') or hasattr(self.tokenizer, 'process_images')
+                if has_processor:
+                    text = self.tokenizer.apply_chat_template(
+                        text_messages, tokenize=False, add_generation_prompt=True,
+                        enable_thinking=enable_thinking,
+                    )
+                    proc_inputs = self.tokenizer(
+                        text=[text],
+                        images=images,
+                        return_tensors="pt",
+                    )
+                    input_ids = proc_inputs["input_ids"]
+                    if "pixel_values" in proc_inputs:
+                        pixel_values = proc_inputs["pixel_values"]
+                    if "image_grid_thw" in proc_inputs:
+                        image_grid_thw = proc_inputs["image_grid_thw"]
+                    return None, input_ids, pixel_values, image_grid_thw
+            except Exception as e:
+                logger.warning(f"Processor-based image handling failed: {e}, falling back to text-only")
+
         if hasattr(self.tokenizer, 'apply_chat_template') and self.tokenizer.chat_template:
-            return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
+            prompt = self.tokenizer.apply_chat_template(
+                text_messages, tokenize=False, add_generation_prompt=True,
                 enable_thinking=enable_thinking,
             )
-        return "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+        else:
+            prompt = "\n".join(f"{m['role']}: {m['content']}" for m in text_messages)
+
+        return prompt, None, pixel_values, image_grid_thw
 
 
 # ── FastAPI app ─────────────────────────────────────────────────────────
@@ -312,8 +451,18 @@ def create_app(generator: AirLLMGenerator) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
-        messages = [{"role": m.role, "content": m.content}
-                    for m in req.messages]
+        messages = []
+        for m in req.messages:
+            if isinstance(m.content, list):
+                content_list = []
+                for part in m.content:
+                    if part.type == "text" and part.text:
+                        content_list.append({"type": "text", "text": part.text})
+                    elif part.type == "image_url" and part.image_url:
+                        content_list.append({"type": "image_url", "image_url": {"url": part.image_url.url}})
+                messages.append({"role": m.role, "content": content_list})
+            else:
+                messages.append({"role": m.role, "content": m.content or ""})
         req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
         if req.stream:
