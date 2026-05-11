@@ -42,9 +42,10 @@ class AirLLMQWen3_5VL(AirLLMBaseModel):
         super().__init__(model_local_path_or_repo_id, *args, **kwargs)
         self._supports_cache_class = True
 
-        self._lm_head_tied = True
-        self.layer_names = [ln for ln in self.layer_names if ln != 'lm_head']
-        self.layers = self.layers[:-1]
+        self._lm_head_tied = getattr(self.config, 'tie_word_embeddings', True)
+        if self._lm_head_tied:
+            self.layer_names = [ln for ln in self.layer_names if ln != 'lm_head']
+            self.layers = self.layers[:-1]
 
     def _adjust_config_for_model(self):
         if hasattr(self.config, 'text_config'):
@@ -544,7 +545,10 @@ class AirLLMQWen3_5VL(AirLLMBaseModel):
                         batch[j] = self.run_norm(layer, seq)
 
                     elif layer_name == self.layer_names_dict['lm_head']:
-                        pass
+                        if self._lm_head_tied:
+                            pass
+                        else:
+                            batch[j] = layer(seq).float()
 
                     else:
                         layer_idx = i - 1
@@ -587,6 +591,8 @@ class AirLLMQWen3_5VL(AirLLMBaseModel):
         if getattr(self, '_lm_head_tied', False):
             self.model.lm_head.weight = self.model.model.language_model.embed_tokens.weight
             logits = self.model.lm_head(logits_hidden).float()
+        else:
+            logits = logits_hidden.float()
 
         if self.profiling_mode:
             forward_elapsed_time = time.process_time() - forward_start

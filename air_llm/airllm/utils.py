@@ -251,99 +251,69 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         check_space(checkpoint_path, layer_shards_saving_path, compression, splitted_model_dir_name=splitted_model_dir_name)
 
 
-    shard = 0
-    n_shards = len(set(index.values()))
-    state_dict = {}
-
+    weight_map = index
 
     if not os.path.exists(saving_path):
-        #os.makedirs(saving_path)
         saving_path.mkdir(parents=True, exist_ok=True)
 
-    single_modelfile = None
+    loaded_files = set()
+    state_dict = {}
+    all_original_files = set(weight_map.values())
 
-    # build shard number -> filename mapping from weight_map
-    shard_filenames = {}
-    for v in index.values():
-        if '-' in v:
-            parts = v.split('-')
-            if len(parts) > 1:
-                try:
-                    shard_num = int(parts[1])
-                    shard_filenames[shard_num] = v
-                except ValueError:
-                    pass
+    if delete_original:
+        file_last_layer = {}
+        for i, layer in enumerate(layers):
+            for k, v in weight_map.items():
+                if k.startswith(layer):
+                    file_last_layer[v] = max(file_last_layer.get(v, 0), i)
 
-    for layer in tqdm(layers):
+    for i, layer in enumerate(tqdm(layers)):
+        layer_files = set()
+        for k, v in weight_map.items():
+            if k.startswith(layer):
+                layer_files.add(v)
 
-        shards = [int(v.split('-')[1]) for k, v in index.items() if k.startswith(layer) and '-' in v and len(v.split('-')) > 1]
-        if len(shards) > 0:
-            if max(shards) > shard:
-                if delete_original and shard != 0:
-                    old_filename = shard_filenames.get(shard, f'model-000{shard:02d}-of-000{n_shards:02d}.safetensors' if safetensors_format else f'pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin')
-                    to_delete = checkpoint_path / old_filename
-                    print(f"deleting original file: {to_delete}")
-                    remove_real_and_linked_file(to_delete)
-                shard += 1
-                print(f'Loading shard {shard}/{n_shards}')
+        if not layer_files:
+            continue
 
-                to_load = shard_filenames.get(shard)
-                if to_load is None:
-                    to_load = f'model-000{shard:02d}-of-000{n_shards:02d}.safetensors' if safetensors_format else f'pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin'
-                to_load = checkpoint_path / to_load
-
-                # check if to_load exist, if not downloaad it...
-                if not os.path.exists(to_load):
-                    assert repo_id is not None
-                    huggingface_hub.snapshot_download(repo_id, allow_patterns=os.path.basename(to_load),
-                                                    token=hf_token)
-
-                if not safetensors_format:
-                    state_dict.update(torch.load(to_load, map_location='cpu'))
+        for filename in layer_files:
+            if filename not in loaded_files:
+                to_load = checkpoint_path / filename
+                if not os.path.exists(str(to_load)) and repo_id is not None:
+                    huggingface_hub.snapshot_download(repo_id, allow_patterns=filename, token=hf_token)
+                if safetensors_format:
+                    state_dict.update(load_file(str(to_load), device='cpu'))
                 else:
-                    state_dict.update(load_file(to_load, device='cpu'))
+                    state_dict.update(torch.load(str(to_load), map_location='cpu'))
+                loaded_files.add(filename)
 
-        else:
-            shards = [v for k, v in index.items() if k.startswith(layer)]
-            if len(shards) == 0:
-                # no weights for this layer (e.g. tied lm_head), skip
-                continue
-            single_modelfile = shards[0]
-            to_load = checkpoint_path / single_modelfile
-            # check if to_load exist, if not downloaad it...
-            if not os.path.exists(to_load):
-                assert repo_id is not None
-                huggingface_hub.snapshot_download(repo_id, allow_patterns=os.path.basename(to_load),
-                                                token=hf_token)
-            if not safetensors_format:
-                state_dict.update(torch.load(to_load, map_location='cpu'))
-            else:
-                state_dict.update(load_file(to_load, device='cpu'))
-
-        # Get layer state dict
-        layer_state_dict = dict([(k, v) for k, v in state_dict.items() if k.startswith(layer)])
+        layer_state_dict = {k: v for k, v in state_dict.items() if k.startswith(layer)}
 
         layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
-
-        # Save layer state dict as using safetensors
 
         marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
         if not marker_exists:
             ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
 
-        # Free memory
-        for k in layer_state_dict.keys():
+        for k in layer_state_dict:
             if k in state_dict:
                 del state_dict[k]
         del layer_state_dict
         clean_memory()
 
-    # deleting single modelfile if only a single modelfile was existing in hf repo 
-    # and deletion of single modelfile should happen in the end if delete_original=True
-    if delete_original and single_modelfile != None:
-        to_delete = checkpoint_path / single_modelfile
-        print(f"deleting original file: {to_delete}")
-        remove_real_and_linked_file(to_delete)
+        if delete_original:
+            for filename in list(loaded_files):
+                if file_last_layer.get(filename, -1) <= i:
+                    to_delete = checkpoint_path / filename
+                    if os.path.exists(str(to_delete)):
+                        remove_real_and_linked_file(str(to_delete))
+                    loaded_files.discard(filename)
+
+    if delete_original:
+        for filename in all_original_files:
+            to_delete = checkpoint_path / filename
+            if os.path.exists(str(to_delete)):
+                remove_real_and_linked_file(str(to_delete))
 
     return str(saving_path)
 

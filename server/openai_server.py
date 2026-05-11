@@ -127,7 +127,9 @@ class AirLLMGenerator:
     _THINK_PATTERN = re.compile(r"<think\s*>(.*?)</think\s*>", re.DOTALL)
 
     def __init__(self, model_path: str, device: str = "cuda:0",
-                 dtype: str = "float16", max_seq_len: int = 4096):
+                 dtype: str = "float16", max_seq_len: int = 4096,
+                 compression: str | None = None,
+                 prefetching: bool = False):
         from airllm import AutoModel
         self.model_path = model_path
         self.device = device
@@ -143,7 +145,8 @@ class AirLLMGenerator:
         self.max_seq_len = max_seq_len
         self.model = AutoModel.from_pretrained(
             model_path, device=device, dtype=self._dtype,
-            max_seq_len=max_seq_len, prefetching=False,
+            max_seq_len=max_seq_len, compression=compression,
+            prefetching=prefetching,
         )
         self.tokenizer = self.model.tokenizer
         if self.is_multimodal and hasattr(self.tokenizer, 'tokenizer'):
@@ -595,6 +598,10 @@ def main():
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--compression", type=str, default=None,
+                        help="Weight compression: '4bit' or '8bit' (requires bitsandbytes)")
+    parser.add_argument("--prefetching", action="store_true", default=False,
+                        help="Overlap disk I/O with GPU compute during layer loading")
     args = parser.parse_args()
 
     print(f"Loading model from {args.model_path} ...")
@@ -603,6 +610,8 @@ def main():
         device=args.device,
         dtype=args.dtype,
         max_seq_len=args.max_seq_len,
+        compression=args.compression,
+        prefetching=args.prefetching,
     )
     print(f"Model '{generator.model_name}' loaded. Starting server...")
 
